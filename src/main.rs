@@ -4,6 +4,8 @@ extern crate rand;
 extern crate serde_derive;
 extern crate bincode;
 extern crate base64;
+extern crate serde_json;
+extern crate chrono;
 extern crate rpassword;
 
 use rpassword::read_password;
@@ -14,9 +16,16 @@ use crypto::{ symmetriccipher, buffer, aes, blockmodes };
 use crypto::buffer::{ ReadBuffer, WriteBuffer, BufferResult };
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
+use std::io::{Error, ErrorKind};
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use rand::RngCore;
+use std::io::BufReader;
+use std::fs::{
+	self,
+	File,
+};
+use chrono::prelude::*;
 
 use std::io::{
 	self,
@@ -72,7 +81,7 @@ fn decrypt(encrypted_data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symm
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct Secret {
 	key: String,
-	value: Vec<String>,
+	value: Vec<(DateTime<Local>, String)>,
 }
 
 fn get_session_key_from_user() -> Result<SessionKey, ()> {
@@ -103,12 +112,6 @@ fn fill_with_ascending(v: &mut [u8]) {
 	}
 }
 
-fn path_for(key: &str) -> PathBuf {
-	let mut path = PathBuf::new();
-	path.push("key");
-	path
-}
-
 struct SessionKey {
 	key: [u8; 32],
 	iv: [u8; 16],
@@ -129,8 +132,32 @@ fn print_help() {
 	println!("HELPY HELPY HELP");
 }
 
+fn get_store_path() -> Result<PathBuf, std::io::Error> {
+	if let Some(arg) = std::env::args().nth(1) {
+		// 1st choice: user provided location as argument
+		return Ok(PathBuf::from(arg));
+	}
+	
+	// 2nd choice. Try find a "config.json" at same path as this binary
+	let config_file = {
+		let mut p = PathBuf::from(std::env::args().nth(0).unwrap());
+		p.pop();
+		p.push("config.json");
+		File::open(&p)?
+	};
+    let mut buf_reader = BufReader::new(config_file);
+    let mut contents = String::new();
+    buf_reader.read_to_string(&mut contents)?;
+    let v: serde_json::Value = serde_json::from_str(&contents)?;
+    if let Some(Some(s)) = v.get("store_path").map(|x| x.as_str()) {
+    	return Ok(PathBuf::from(s))
+    }
+    Err(Error::new(ErrorKind::Other, "oh no!"))
+}
+
 fn main() {
-    // step 1: get user session keys
+	let store_path = get_store_path().expect("Failed to read store path");
+	println!("store path {:?}", &store_path);
     let session_key = get_session_key_from_user()
     .expect("Failed to get session key");
     println!("REPL started. Enter `?` for help.");
@@ -140,46 +167,167 @@ fn main() {
     	if !read_cleaned_stdin_line(&mut cmd_input) {
     		panic!("Failed to read from stdin");
     	}
-    	let tokens: Vec<&str> = cmd_input.split(" ").collect();
+    	let tokens: Vec<&str> = cmd_input.split(" ").filter(|x| x.len() > 0).collect();
     	if tokens.len() == 0 {continue}
     	match &tokens[0] as &str {
     		"?" => print_help(),
     		"get" => {
-    			if tokens.len() < 2 {
-    				println!("Expecting 2 tokens for `get`");
+    			if tokens.len() == 2 {
+    				cmd_get(&session_key, tokens[1], &store_path);
     			} else {
-    				cmd_get(&session_key, tokens[1]);
+    				println!("Expecting 2 tokens for `{}`", tokens[0]);
     			}
     		},
+    		"push" => {
+    			if tokens.len() == 3 {
+    				cmd_push(&session_key, tokens[1], tokens[2], &store_path);
+    			} else {
+    				println!("Expecting 3 tokens for `{}`", tokens[0]);
+    			}
+    		},
+    		"pop" => {
+    			if tokens.len() == 2 {
+    				cmd_pop(&session_key, tokens[1], &store_path);
+    			} else {
+    				println!("Expecting 2 tokens for `{}`", tokens[0]);
+    			}
+    		}
+
     		_ => {println!("Unknown command. Enter `?` for help.");}
     	}
     }
 }
 
-fn cmd_get(session_key: &SessionKey, key: &str) {
-	println!("GETTTTY");
+fn push_file_name_for(pb: &mut PathBuf, session_key: &SessionKey, key: &str) {
+	let mut hasher = Sha256::new();
+	hasher.input(&session_key.key);
+	hasher.input_str(&key);
+	hasher.input_str("SALTY_POTATOES");
+	let mut hash_buffer = [0u8; 32];
+	hasher.result(&mut hash_buffer[0..32]);
+	pb.push( base64::encode(&hash_buffer).replace("/", "$"));
 }
 
-fn bogus() {
- //    let payload = Secret {key:"Dank".to_owned(), value:vec!["Memes".to_owned()]};
-	// let mut hasher = Sha256::new();
-	// hasher.input_str(&payload.key);
-	// hasher.input(&key);
-	// hasher.input(&iv);
-	// let mut hash_buffer = [0u8; 32];
-	// hasher.result(&mut hash_buffer[0..32]);
-	// let b64_hash = base64::encode(&hash_buffer);
-	// println!("key hashes to {:?}", &b64_hash);
+fn user_confirmation(msg: &str) -> bool {
+	let mut s = String::new();
+	println!("{} (y/n)", msg);
+	if read_cleaned_stdin_line(&mut s) {
+		match &s as &str {
+			"y" => return true,
+			_ => (),
+		}
+	}
+	println!("aborted.");
+	false
+}
 
-	// let payload_bytes = &serialize(&payload).expect("Failed to serialize");
+fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path) {
+	let mut pb = PathBuf::from(store_path);
+	push_file_name_for(&mut pb, session_key, key);
+	let secret = if let Ok(mut secret) = get_secret_object(session_key, &pb) {
+		if secret.key != key &&
+		!user_confirmation(&key_warning(&secret.key)) {
+			return
+		}
+		secret.value.push((Local::now(), value.to_owned()));
+		secret
+	} else {
+		if !pb.exists() && !user_confirmation("No existing entry found. Push to new entry?") {
+			return;
+		}
+		Secret {
+			key: key.to_owned(),
+			value: vec![
+				(Local::now(), value.to_owned())
+			]
+		}	
+	};
+	if let Err(e) = write_secret_object(session_key, &pb, &secret) {
+		println!("Error: {:?}", e);
+	}
+}
 
- //    let encrypted_data = encrypt(payload_bytes, &key, &iv).ok().unwrap();
- //    println!("enc {:?}", &encrypted_data);
+fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
+	let mut pb = PathBuf::from(store_path);
+	push_file_name_for(&mut pb, session_key, key);
+	if let Ok(mut secret) = get_secret_object(session_key, &pb) {
+		if secret.key != key &&
+		!user_confirmation(&key_warning(&secret.key)) {
+			return
+		}
+		if secret.value.len() == 0 {
+			return;
+		}
+		let to_rem = secret.value.last().unwrap().clone();
+		if !user_confirmation(
+			&format!(
+				"Are you certain you wish to remove ({} | {} | {})",
+				secret.value.len()-1,
+				&to_rem.0.format("%F %T"),
+				to_rem.1,
+			)
+		) {
+			return;
+		}
+		let before = secret.value.len();
+		secret.value.pop();
+		println!("number of secret values {}->{}", before, secret.value.len());
+		if let Err(e) = write_secret_object(session_key, &pb, &secret) {
+			println!("Error: {:?}", e);
+		}
+	} else {
+		println!("Entry not found.");
+		return
+	}
+	
+}
 
- //    let decrypted_data = &decrypt(&encrypted_data[..], &key, &iv).ok().unwrap();
- //    println!("dec {:?}", &decrypted_data);
- //    let payload2 = deserialize(&decrypted_data).expect("Failed to deserialize");
- //    println!("payload2 {:?}", &payload2);
+fn key_warning(found: &str) -> String {
+	format!(
+		"Found unexpected key in loaded secret: {:?}. Continue?",
+		found,
+	)
+}
 
- //    assert!(payload == payload2);
+fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path) {
+	let mut pb = PathBuf::from(store_path);
+	push_file_name_for(&mut pb, session_key, key);
+	match get_secret_object(session_key, &pb) {
+		Ok(secret) => {
+			if secret.key != key &&
+			!user_confirmation(&key_warning(&secret.key)) {
+				return
+			}
+			println!("key: `{}`", secret.key);
+			for (i, value) in secret.value.iter().enumerate() {
+				println!("{:>6} | {} | `{}`", i, &value.0.format("%F %T"), value.1);
+			}
+			if secret.value.is_empty() {
+				println!("  <no values>");
+			}
+		},
+		Err(e) => println!("NAH {:?}", e),
+	}
+}
+
+fn write_secret_object(session_key: &SessionKey, file_path: &Path, secret: &Secret) -> Result<(), std::io::Error> {
+	let mut file = File::create(file_path)?;
+	let payload_bytes = &serialize(&secret).expect("Failed to serialize");
+    let encrypted_data = encrypt(payload_bytes, &session_key.key, &session_key.iv).ok().unwrap();
+    file.write_all(&encrypted_data)?;
+    Ok(())
+}
+
+
+fn get_secret_object(session_key: &SessionKey, file_path: &Path) -> Result<Secret, std::io::Error> {
+	let file = File::open(file_path)?;
+    let mut buf_reader = BufReader::new(file);
+    let mut buf = vec![];
+    buf_reader.read_to_end(&mut buf)?;
+    if let Ok(decrypted_data) = decrypt(&buf, &session_key.key, &session_key.iv) {
+    	return deserialize(&decrypted_data).map_err(
+    		|_| Error::new(ErrorKind::Other, "Bincode deserialize failed")
+    	)
+    }
+    Err(Error::new(ErrorKind::Other, "Failed to decrypt that file"))
 }
