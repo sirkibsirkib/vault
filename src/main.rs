@@ -1,5 +1,5 @@
 extern crate crypto;
-extern crate rand;
+// extern crate rand;
 #[macro_use]
 extern crate serde_derive;
 extern crate bincode;
@@ -19,7 +19,6 @@ use crypto::sha2::Sha256;
 use std::io::{Error, ErrorKind};
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use rand::RngCore;
 use std::io::BufReader;
 use std::fs::{
 	self,
@@ -32,7 +31,6 @@ use std::io::{
 	Read,
 	Write,
 };
-use rand::{Rng, SeedableRng, StdRng, OsRng};
 
 fn encrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
     let mut encryptor = aes::cbc_encryptor(
@@ -85,24 +83,21 @@ struct Secret {
 }
 
 fn get_session_key_from_user() -> Result<SessionKey, ()> {
-    let mut key: [u8; 32] = [0; 32];
-    fill_with_ascending(&mut key);
-    print!("Type a password: ");
-	stdout().flush();
-
-    let password: String = read_password().unwrap();
-    println!("\rThe password is: '{}'", password);
-
-	let password_bytes = password.trim_right().as_bytes();
-	if password_bytes.len() > 32 {
-		println!("TOO MANY");
-		return Err(())
-	}
-	for (i, b) in password_bytes.iter().cloned().take(32).enumerate() {
-		key[i] = b;
-	}
     let mut iv = [0u8; 16];
     fill_with_ascending(&mut iv);
+
+    let mut key = [0u8; 32];
+    print!("Type a password: ");
+	if stdout().flush().is_err() { return Err(()) }
+    let password: String = read_password().unwrap();
+
+    let mut hasher = Sha256::new();
+	hasher.input_str(&password);
+	hasher.input(&iv);
+	hasher.input_str("OH_YEAH_SALT");
+	hasher.result(&mut key[0..32]);
+	let sanity = &base64::encode(&key[..2])[..3];
+	println!("password sanity hash is: `{}`", sanity);
     Ok(SessionKey{ key, iv })
 }
 
@@ -119,7 +114,7 @@ struct SessionKey {
 
 fn read_cleaned_stdin_line(s: &mut String) -> bool {
 	s.clear();
-	if let Ok(b) = io::stdin().read_line(s) {
+	if let Ok(_bytes) = io::stdin().read_line(s) {
 	    let len_withoutcrlf = s.trim_right().len();
 	    s.truncate(len_withoutcrlf);
 	    true
@@ -129,8 +124,14 @@ fn read_cleaned_stdin_line(s: &mut String) -> bool {
 }
 
 fn print_help() {
-	println!("HELPY HELPY HELP");
+	println!("commands:
+- get <x>      reads and prints values for key `x`
+- push <x> <y> appends value `y` to entry for key `x`
+- pop <x>      pops the most recent value for key `x`
+- rm <x>       removes the entire entry for key `x`
+- ?            prints help");
 }
+
 
 fn get_store_path() -> Result<PathBuf, std::io::Error> {
 	if let Some(arg) = std::env::args().nth(1) {
@@ -156,7 +157,10 @@ fn get_store_path() -> Result<PathBuf, std::io::Error> {
 }
 
 fn main() {
-	let store_path = get_store_path().expect("Failed to read store path");
+	let store_path = match get_store_path() {
+		Ok(s) => s,
+		Err(_) => { println!("Failed to read store path"); return; },
+	};
 	println!("store path {:?}", &store_path);
     let session_key = get_session_key_from_user()
     .expect("Failed to get session key");
@@ -188,6 +192,13 @@ fn main() {
     		"pop" => {
     			if tokens.len() == 2 {
     				cmd_pop(&session_key, tokens[1], &store_path);
+    			} else {
+    				println!("Expecting 2 tokens for `{}`", tokens[0]);
+    			}
+    		},
+    		"rm" => {
+    			if tokens.len() == 2 {
+    				cmd_rm(&session_key, tokens[1], &store_path);
     			} else {
     				println!("Expecting 2 tokens for `{}`", tokens[0]);
     			}
@@ -247,6 +258,35 @@ fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path)
 	}
 }
 
+fn cmd_rm(session_key: &SessionKey, key: &str, store_path: &Path) {
+	let mut pb = PathBuf::from(store_path);
+	push_file_name_for(&mut pb, session_key, key);
+	if pb.exists() {
+		if let Ok(secret) = get_secret_object(session_key, &pb) {
+			if secret.key != key &&
+			!user_confirmation(&key_warning(&secret.key)) {
+				return
+			}
+			if !user_confirmation(&format!(
+					"Are you certain you want to delete this key with {} entries?",
+					secret.value.len(),
+				)) {
+				return
+			}
+		} else  {
+			if !user_confirmation("Found entry file, but cannot open it using current config. Proceed with rm?") {
+				return
+			}
+		};
+		if let Err(e) = fs::remove_file(&pb) {
+			println!("Error {:?}", e);
+			println!("Entry file deleted.");
+		}
+	} else {
+		println!("Failed to find entry file.");
+	}
+}
+
 fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
 	let mut pb = PathBuf::from(store_path);
 	push_file_name_for(&mut pb, session_key, key);
@@ -279,7 +319,6 @@ fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
 		println!("Entry not found.");
 		return
 	}
-	
 }
 
 fn key_warning(found: &str) -> String {
@@ -306,7 +345,7 @@ fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path) {
 				println!("  <no values>");
 			}
 		},
-		Err(e) => println!("NAH {:?}", e),
+		Err(e) => println!("Error {:?}", e),
 	}
 }
 
