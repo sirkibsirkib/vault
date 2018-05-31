@@ -4,9 +4,13 @@ extern crate crypto;
 extern crate serde_derive;
 extern crate bincode;
 extern crate base64;
+extern crate serde;
 extern crate serde_json;
 extern crate chrono;
 extern crate rpassword;
+extern crate fnv;
+
+use fnv::FnvHashSet;
 
 use rpassword::read_password;
 
@@ -20,6 +24,8 @@ use std::io::{Error, ErrorKind};
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::io::BufReader;
+use serde::ser::Serialize;
+use serde::de::DeserializeOwned;
 use std::fs::{
 	self,
 	File,
@@ -31,6 +37,10 @@ use std::io::{
 	Read,
 	Write,
 };
+
+
+static KEYLIST_KEY: &'static str = "GYggF^DgiuhIUHiuf^&F7fHBVFCr";
+const KEYS_PER_LINE: usize = 7;
 
 fn encrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
     let mut encryptor = aes::cbc_encryptor(
@@ -97,7 +107,7 @@ fn get_session_key_from_user() -> Result<SessionKey, ()> {
 	hasher.input_str("OH_YEAH_SALT");
 	hasher.result(&mut key[0..32]);
 	let sanity = &base64::encode(&key[..2])[..3];
-	println!("password sanity hash is: `{}`", sanity);
+	println!("password sanity hash is: {}", sanity);
     Ok(SessionKey{ key, iv })
 }
 
@@ -125,10 +135,11 @@ fn read_cleaned_stdin_line(s: &mut String) -> bool {
 
 fn print_help() {
 	println!("commands:
-- get <x>      reads and prints values for key `x`
-- push <x> <y> appends value `y` to entry for key `x`
-- pop <x>      pops the most recent value for key `x`
-- rm <x>       removes the entire entry for key `x`
+- get <x>      reads and prints values for key x
+- list         prints all known keys
+- push <x> <y> appends value y to entry for key x
+- pop <x>      pops the most recent value for key x
+- rm <x>       removes the entire entry for key x
 - ?            prints help");
 }
 
@@ -156,6 +167,22 @@ fn get_store_path() -> Result<PathBuf, std::io::Error> {
     Err(Error::new(ErrorKind::Other, "oh no!"))
 }
 
+
+fn get_list_manager<'a>(session_key: &'a SessionKey, store_path: &Path) -> ListManager<'a> {
+	let mut pb = PathBuf::from(store_path);
+	push_file_name_for(&mut pb, session_key, KEYLIST_KEY);
+	if let Ok(kl) = get_secret_object::<KeyList>(session_key, &pb) {
+		ListManager::new_from(session_key, store_path, kl)
+	} else {
+		let kl = KeyList{ v: FnvHashSet::default() };
+		println!("Warning: No existing key-list found. Is this your first session?");
+		if write_secret_object(session_key, &pb, &kl).is_err() {
+			println!("Warning: Failed to write KeyList object.");
+		}
+		ListManager::new_from(session_key, store_path, kl)
+	}
+}
+
 fn main() {
 	let store_path = match get_store_path() {
 		Ok(s) => s,
@@ -164,10 +191,13 @@ fn main() {
 	println!("store path {:?}", &store_path);
     let session_key = get_session_key_from_user()
     .expect("Failed to get session key");
-    println!("REPL started. Enter `?` for help.");
+
+	let mut lm = get_list_manager(&session_key, &store_path);
+    println!("REPL started. Enter ? for help.");
 
     let mut cmd_input = String::new();
     loop {
+    	lm.write_if_changes();
     	if !read_cleaned_stdin_line(&mut cmd_input) {
     		panic!("Failed to read from stdin");
     	}
@@ -177,34 +207,41 @@ fn main() {
     		"?" => print_help(),
     		"get" => {
     			if tokens.len() == 2 {
-    				cmd_get(&session_key, tokens[1], &store_path);
+    				cmd_get(&session_key, tokens[1], &store_path, &mut lm);
     			} else {
-    				println!("Expecting 2 tokens for `{}`", tokens[0]);
+    				println!("Expecting 2 tokens for {}", tokens[0]);
     			}
     		},
     		"push" => {
     			if tokens.len() == 3 {
-    				cmd_push(&session_key, tokens[1], tokens[2], &store_path);
+    				cmd_push(&session_key, tokens[1], tokens[2], &store_path, &mut lm);
     			} else {
-    				println!("Expecting 3 tokens for `{}`", tokens[0]);
+    				println!("Expecting 3 tokens for {}", tokens[0]);
     			}
     		},
     		"pop" => {
     			if tokens.len() == 2 {
-    				cmd_pop(&session_key, tokens[1], &store_path);
+    				cmd_pop(&session_key, tokens[1], &store_path, &mut lm);
     			} else {
-    				println!("Expecting 2 tokens for `{}`", tokens[0]);
+    				println!("Expecting 2 tokens for {}", tokens[0]);
     			}
     		},
     		"rm" => {
     			if tokens.len() == 2 {
-    				cmd_rm(&session_key, tokens[1], &store_path);
+    				cmd_rm(&session_key, tokens[1], &store_path, &mut lm);
     			} else {
-    				println!("Expecting 2 tokens for `{}`", tokens[0]);
+    				println!("Expecting 2 tokens for {}", tokens[0]);
+    			}
+    		},
+    		"list" => {
+    			if tokens.len() == 1 {
+    				lm.print_keys();
+    			} else {
+    				println!("Expecting 1 token for {}", tokens[0]);
     			}
     		}
 
-    		_ => {println!("Unknown command. Enter `?` for help.");}
+    		_ => {println!("Unknown command. Enter ? for help.");}
     	}
     }
 }
@@ -232,10 +269,11 @@ fn user_confirmation(msg: &str) -> bool {
 	false
 }
 
-fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path) {
+fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path, lm: &mut ListManager) {
 	let mut pb = PathBuf::from(store_path);
 	push_file_name_for(&mut pb, session_key, key);
-	let secret = if let Ok(mut secret) = get_secret_object(session_key, &pb) {
+	let secret = if let Ok(mut secret) = get_secret_object::<Secret>(session_key, &pb) {
+		lm.key_exists(key);
 		if secret.key != key &&
 		!user_confirmation(&key_warning(&secret.key)) {
 			return
@@ -244,8 +282,10 @@ fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path)
 		secret
 	} else {
 		if !pb.exists() && !user_confirmation("No existing entry found. Push to new entry?") {
+			lm.key_doesnt_exist(key);
 			return;
 		}
+		lm.key_exists(key);
 		Secret {
 			key: key.to_owned(),
 			value: vec![
@@ -258,11 +298,12 @@ fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path)
 	}
 }
 
-fn cmd_rm(session_key: &SessionKey, key: &str, store_path: &Path) {
+fn cmd_rm(session_key: &SessionKey, key: &str, store_path: &Path, lm: &mut ListManager) {
 	let mut pb = PathBuf::from(store_path);
 	push_file_name_for(&mut pb, session_key, key);
 	if pb.exists() {
-		if let Ok(secret) = get_secret_object(session_key, &pb) {
+		if let Ok(secret) = get_secret_object::<Secret>(session_key, &pb) {
+			lm.key_exists(key);
 			if secret.key != key &&
 			!user_confirmation(&key_warning(&secret.key)) {
 				return
@@ -280,17 +321,19 @@ fn cmd_rm(session_key: &SessionKey, key: &str, store_path: &Path) {
 		};
 		if let Err(e) = fs::remove_file(&pb) {
 			println!("Error {:?}", e);
-			println!("Entry file deleted.");
+		} else {
+			lm.key_doesnt_exist(key);
 		}
 	} else {
+		lm.key_doesnt_exist(key);
 		println!("Failed to find entry file.");
 	}
 }
 
-fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
+fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path, lm: &mut ListManager) {
 	let mut pb = PathBuf::from(store_path);
 	push_file_name_for(&mut pb, session_key, key);
-	if let Ok(mut secret) = get_secret_object(session_key, &pb) {
+	if let Ok(mut secret) = get_secret_object::<Secret>(session_key, &pb) {
 		if secret.key != key &&
 		!user_confirmation(&key_warning(&secret.key)) {
 			return
@@ -307,6 +350,7 @@ fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
 				to_rem.1,
 			)
 		) {
+			lm.key_exists(key);
 			return;
 		}
 		let before = secret.value.len();
@@ -316,6 +360,7 @@ fn cmd_pop(session_key: &SessionKey, key: &str, store_path: &Path) {
 			println!("Error: {:?}", e);
 		}
 	} else {
+		lm.key_doesnt_exist(key);
 		println!("Entry not found.");
 		return
 	}
@@ -328,18 +373,19 @@ fn key_warning(found: &str) -> String {
 	)
 }
 
-fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path) {
+fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path, lm: &mut ListManager) {
 	let mut pb = PathBuf::from(store_path);
 	push_file_name_for(&mut pb, session_key, key);
-	match get_secret_object(session_key, &pb) {
+	match get_secret_object::<Secret>(session_key, &pb) {
 		Ok(secret) => {
+			lm.key_exists(key);
 			if secret.key != key &&
 			!user_confirmation(&key_warning(&secret.key)) {
 				return
 			}
-			println!("key: `{}`", secret.key);
+			println!("key: {}", secret.key);
 			for (i, value) in secret.value.iter().enumerate() {
-				println!("{:>6} | {} | `{}`", i, &value.0.format("%F %T"), value.1);
+				println!("{:>6} | {} | {}", i, &value.0.format("%F %T"), value.1);
 			}
 			if secret.value.is_empty() {
 				println!("  <no values>");
@@ -349,16 +395,16 @@ fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path) {
 	}
 }
 
-fn write_secret_object(session_key: &SessionKey, file_path: &Path, secret: &Secret) -> Result<(), std::io::Error> {
+fn write_secret_object<T:Serialize>(session_key: &SessionKey, file_path: &Path, t: &T) -> Result<(), std::io::Error> {
 	let mut file = File::create(file_path)?;
-	let payload_bytes = &serialize(&secret).expect("Failed to serialize");
+	let payload_bytes = &serialize(&t).expect("Failed to serialize");
     let encrypted_data = encrypt(payload_bytes, &session_key.key, &session_key.iv).ok().unwrap();
     file.write_all(&encrypted_data)?;
     Ok(())
 }
 
 
-fn get_secret_object(session_key: &SessionKey, file_path: &Path) -> Result<Secret, std::io::Error> {
+fn get_secret_object<T:DeserializeOwned>(session_key: &SessionKey, file_path: &Path) -> Result<T, std::io::Error> {
 	let file = File::open(file_path)?;
     let mut buf_reader = BufReader::new(file);
     let mut buf = vec![];
@@ -369,4 +415,58 @@ fn get_secret_object(session_key: &SessionKey, file_path: &Path) -> Result<Secre
     	)
     }
     Err(Error::new(ErrorKind::Other, "Failed to decrypt that file"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KeyList {
+	v: FnvHashSet<String>,
+}
+
+
+struct ListManager<'a> {
+	kl: KeyList,
+	pb: PathBuf,
+	session_key: &'a SessionKey,
+	changes: bool,
+}
+
+impl<'a> ListManager<'a> {
+	fn new_from(session_key: &'a SessionKey, store_path: &Path, kl: KeyList) -> Self {
+		let mut pb = PathBuf::from(store_path);
+		push_file_name_for(&mut pb, session_key, KEYLIST_KEY);
+		Self { kl, pb, session_key, changes: false }
+	}
+
+	fn key_exists(&mut self, key: &str) {
+		if !self.kl.v.contains(key) {
+			self.kl.v.insert(key.to_owned());
+			self.changes = true;
+		}
+	}
+	fn key_doesnt_exist(&mut self, key: &str) {
+		if self.kl.v.contains(key) {
+			self.kl.v.remove(key);
+			self.changes = true;
+		}
+	}
+	fn write_if_changes(&mut self) {
+		if self.changes {
+			if write_secret_object(self.session_key, &self.pb, &self.kl).is_err() {
+				println!("Warning: Failed to write KeyList object.");
+			}
+			self.changes = false;
+		}
+	}
+	fn print_keys(&self) {
+		print!("known keys: ");
+		let comma_index = self.kl.v.len()-1;
+		for (i, key) in self.kl.v.iter().enumerate() {
+			if i%KEYS_PER_LINE==0 { println!() }
+			print!("{}", key);
+			if i < comma_index {
+				print!(", ")
+			}
+		}
+		println!();
+	}
 }
