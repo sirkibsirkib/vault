@@ -23,7 +23,9 @@ your stored values by key.
 
 All your persistent data is stored in a single user-passed (or configured) directory.
 Vault relies on hashing to obfuscate the keys your store has populated, and uses
-AES encryption to hide the values associated with those keys. 
+AES encryption to hide the values associated with those keys. Additionally, value
+data is padded with random noise to decouple persistent filesize from the length of
+stored values.
 
 To make sense of any of this, the user must provide a super-password at startup,
 whose hash is used to salt the other security functions. As a result, several different
