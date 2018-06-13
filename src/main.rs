@@ -5,12 +5,14 @@ extern crate serde_derive;
 extern crate bincode;
 extern crate base64;
 extern crate serde;
+extern crate rand;
 extern crate serde_json;
 extern crate chrono;
 extern crate rpassword;
 extern crate fnv;
 
 use fnv::FnvHashSet;
+use rand::Rng;
 
 use rpassword::read_password;
 
@@ -90,6 +92,7 @@ fn decrypt(encrypted_data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, symm
 struct Secret {
 	key: String,
 	value: Vec<(DateTime<Local>, String)>,
+	noise: Vec<u8>, // never used. just gives the secret some arbi
 }
 
 fn get_session_key_from_user() -> Result<SessionKey, ()> {
@@ -107,7 +110,7 @@ fn get_session_key_from_user() -> Result<SessionKey, ()> {
 	hasher.input_str("OH_YEAH_SALT");
 	hasher.result(&mut key[0..32]);
 	let sanity = &base64::encode(&key[..2])[..3];
-	println!("password sanity hash is: {}", sanity);
+	println!("password sanity hash: {}", sanity);
     Ok(SessionKey{ key, iv })
 }
 
@@ -135,8 +138,9 @@ fn read_cleaned_stdin_line(s: &mut String) -> bool {
 
 fn print_help() {
 	println!("commands:
-- get <x>      reads and prints values for key x
 - list         prints all known keys
+- filename     prints the filename associated with key x
+- get <x>      reads and prints values for key x
 - push <x> <y> appends value y to entry for key x
 - pop <x>      pops the most recent value for key x
 - rm <x>       removes the entire entry for key x
@@ -239,21 +243,32 @@ fn main() {
     			} else {
     				println!("Expecting 1 token for {}", tokens[0]);
     			}
-    		}
+    		},
+    		"filename" => {
+    			if tokens.len() == 2 {
+    				println!("{}", filename_for(&session_key, tokens[1]));
+    			} else {
+    				println!("Expecting 2 token for {}", tokens[0]);
+    			}
+    		},
 
     		_ => {println!("Unknown command. Enter ? for help.");}
     	}
     }
 }
 
-fn push_file_name_for(pb: &mut PathBuf, session_key: &SessionKey, key: &str) {
+fn filename_for(session_key: &SessionKey, key: &str) -> String {
 	let mut hasher = Sha256::new();
 	hasher.input(&session_key.key);
 	hasher.input_str(&key);
 	hasher.input_str("SALTY_POTATOES");
 	let mut hash_buffer = [0u8; 32];
 	hasher.result(&mut hash_buffer[0..32]);
-	pb.push( base64::encode(&hash_buffer).replace("/", "$"));
+	base64::encode(&hash_buffer).replace("/", "$")
+}
+
+fn push_file_name_for(pb: &mut PathBuf, session_key: &SessionKey, key: &str) {
+	pb.push(filename_for(session_key, key));
 }
 
 fn user_confirmation(msg: &str) -> bool {
@@ -271,7 +286,8 @@ fn user_confirmation(msg: &str) -> bool {
 
 fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path, lm: &mut ListManager) {
 	let mut pb = PathBuf::from(store_path);
-	push_file_name_for(&mut pb, session_key, key);
+	let filename = filename_for(session_key, key); 
+	pb.push(&filename);
 	let secret = if let Ok(mut secret) = get_secret_object::<Secret>(session_key, &pb) {
 		lm.key_exists(key);
 		if secret.key != key &&
@@ -281,16 +297,15 @@ fn cmd_push(session_key: &SessionKey, key: &str, value: &str, store_path: &Path,
 		secret.value.push((Local::now(), value.to_owned()));
 		secret
 	} else {
-		if !pb.exists() && !user_confirmation("No existing entry found. Push to new entry?") {
-			lm.key_doesnt_exist(key);
-			return;
-		}
 		lm.key_exists(key);
+		let noise_length: usize = rand::thread_rng().gen_range(0, 128);
 		Secret {
 			key: key.to_owned(),
 			value: vec![
 				(Local::now(), value.to_owned())
-			]
+			],
+			noise: filename.as_bytes().iter().cloned()
+					.cycle().take(noise_length).collect(),
 		}	
 	};
 	if let Err(e) = write_secret_object(session_key, &pb, &secret) {
@@ -391,7 +406,14 @@ fn cmd_get(session_key: &SessionKey, key: &str, store_path: &Path, lm: &mut List
 				println!("  <no values>");
 			}
 		},
-		Err(e) => println!("Error {:?}", e),
+		Err(e) => {
+			let msg = match e.kind() {
+				ErrorKind::Other => "Failed to deserialize data.",
+				ErrorKind::InvalidData => "Failed to decrypt data.",
+				_ => "Failed to open file."
+			};
+			println!("{}", msg);
+		},
 	}
 }
 
@@ -411,10 +433,10 @@ fn get_secret_object<T:DeserializeOwned>(session_key: &SessionKey, file_path: &P
     buf_reader.read_to_end(&mut buf)?;
     if let Ok(decrypted_data) = decrypt(&buf, &session_key.key, &session_key.iv) {
     	return deserialize(&decrypted_data).map_err(
-    		|_| Error::new(ErrorKind::Other, "Bincode deserialize failed")
+    		|_| Error::new(ErrorKind::Other, "bincode")
     	)
     }
-    Err(Error::new(ErrorKind::Other, "Failed to decrypt that file"))
+    Err(Error::new(ErrorKind::InvalidData, "aes"))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
