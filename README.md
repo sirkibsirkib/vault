@@ -30,4 +30,4 @@ stored values.
 To make sense of any of this, the user must provide a super-password at startup,
 whose hash is used to salt the other security functions. As a result, several different
 vaults could exist in the same directory without them being able to read one another's data at all,
-and without stepping on each other's toes (except for highly unliekly 128-bit hash collisions).
+and without stepping on each other's toes (except for highly unlikely 128-bit hash collisions).
