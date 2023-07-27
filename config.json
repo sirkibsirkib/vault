@@ -1,1 +1,3 @@
-store_path = "C:\\Git\\vault_entries"
+{
+	"store_path" : "C:\\Git\\vault_entries"
+}
